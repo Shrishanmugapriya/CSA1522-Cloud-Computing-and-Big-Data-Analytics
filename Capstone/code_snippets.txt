@@ -1,0 +1,795 @@
+================================================================================
+CLOUD-BASED COLLABORATIVE DOCUMENT EDITING AND VERSION CONTROL PLATFORM
+MAIN SOURCE CODE SNIPPETS COMPILATION
+================================================================================
+
+PROJECT SUMMARY:
+Real-Time Collaborative Rich-Text Editing Engine powered by Y.js CRDT,
+WebSockets, React/Tiptap, Node.js/Express, JWT Authentication, and MongoDB Atlas.
+
+TABLE OF CONTENTS:
+--------------------------------------------------------------------------------
+1. SERVER MAIN ENTRY POINT (server/server.js)
+2. WEBSOCKET CRDT SYNC SERVER (server/websocket/collaboration.js)
+3. MONGOOSE DATA MODELS:
+   - Document Schema (server/models/Document.js)
+   - Version Schema (server/models/Version.js)
+   - User Schema (server/models/User.js)
+4. JWT AUTHENTICATION MIDDLEWARE & ROUTES:
+   - Auth Middleware (server/middleware/auth.js)
+   - Auth Routes (server/routes/auth.js)
+5. DOCUMENT CRUD & COLLABORATOR ROUTES (server/routes/documents.js)
+6. VERSION CONTROL & RESTORATION ROUTES (server/routes/versions.js)
+7. CLIENT API SERVICE (client/src/services/api.js)
+8. COLLABORATIVE DOCUMENT EDITOR COMPONENT (client/src/pages/DocumentEditor.jsx)
+9. VERSION HISTORY COMPONENT (client/src/components/VersionHistory.jsx)
+10. COLLABORATORS & ACCESS MANAGEMENT COMPONENT (client/src/components/Collaborators.jsx)
+11. DOCUMENT EXPORT UTILITIES (client/src/utils/exportUtils.js)
+================================================================================
+
+
+--------------------------------------------------------------------------------
+1. SERVER MAIN ENTRY POINT (server/server.js)
+--------------------------------------------------------------------------------
+import express from 'express';
+import http from 'http';
+import mongoose from 'mongoose';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import authRoutes from './routes/auth.js';
+import documentRoutes from './routes/documents.js';
+import versionRoutes from './routes/versions.js';
+import { setupCollaborationServer } from './websocket/collaboration.js';
+
+dotenv.config();
+
+const app = express();
+const server = http.createServer(app);
+
+const PORT = process.env.PORT || 5000;
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/collaborative_docs';
+
+// Middlewares
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
+// Health Check API
+app.get('/api/health', (req, res) => {
+  const dbState = mongoose.connection.readyState;
+  const statusMap = { 0: 'Disconnected', 1: 'Connected', 2: 'Connecting', 3: 'Disconnecting' };
+  res.json({
+    status: 'OK',
+    service: 'Cloud Collaborative Editor API',
+    database: statusMap[dbState] || 'Unknown',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Register API Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/documents', documentRoutes);
+app.use('/api/documents', versionRoutes);
+
+// Initialize Y.js WebSocket Server
+setupCollaborationServer(server);
+
+// Connect to MongoDB & Start Server
+mongoose.connect(MONGODB_URI)
+  .then(() => {
+    console.log(`✅ MongoDB Connected Successfully (${MONGODB_URI})`);
+    server.listen(PORT, () => {
+      console.log(`🚀 Collaborative Docs Backend Server running on http://localhost:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('❌ MongoDB Connection Error:', err.message);
+    server.listen(PORT, () => {
+      console.log(`⚠️ Express running on http://localhost:${PORT} in degraded state.`);
+    });
+  });
+
+
+--------------------------------------------------------------------------------
+2. WEBSOCKET CRDT SYNC SERVER (server/websocket/collaboration.js)
+--------------------------------------------------------------------------------
+import { WebSocketServer } from 'ws';
+import jwt from 'jsonwebtoken';
+import { setupWSConnection } from 'y-websocket/bin/utils';
+import Document from '../models/Document.js';
+import { checkDocumentAccess } from '../routes/documents.js';
+
+const JWT_SECRET = process.env.JWT_SECRET || 'capstone_secret_jwt_key_collaborative_docs_2026';
+
+export function setupCollaborationServer(server) {
+  const wss = new WebSocketServer({ noServer: true });
+
+  wss.on('connection', (conn, req, { docName } = {}) => {
+    if (req.url.includes('/ping-test')) {
+      conn.on('message', (message) => {
+        try {
+          const data = JSON.parse(message.toString());
+          if (data.type === 'ping') {
+            conn.send(JSON.stringify({ type: 'pong', timestamp: data.timestamp }));
+          }
+        } catch (e) {
+          conn.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+        }
+      });
+      return;
+    }
+    // Bind Y.js WebSocket room synchronization handler
+    setupWSConnection(conn, req, { docName: docName || req.url.slice(1) });
+  });
+
+  server.on('upgrade', async (request, socket, head) => {
+    const parsedUrl = new URL(request.url, 'http://localhost');
+    const pathname = parsedUrl.pathname;
+
+    if (pathname.includes('/ping-test')) {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request, { docName: 'ping-test' });
+      });
+      return;
+    }
+
+    if (pathname.startsWith('/ws') || pathname.startsWith('/doc-')) {
+      // 1. Verify JWT Authentication Token
+      const token = parsedUrl.searchParams.get('token');
+      if (!token) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
+      let userId;
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        userId = decoded.id;
+      } catch (err) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
+      // 2. Verify Document Access Permissions
+      const docName = pathname.replace(/^\//, '');
+      const rawDocId = docName.startsWith('doc-') ? docName.slice(4) : docName;
+
+      try {
+        const doc = await Document.findById(rawDocId);
+        if (!doc) {
+          socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+
+        const { hasAccess } = checkDocumentAccess(doc, userId);
+        if (!hasAccess) {
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+
+        // Upgrade socket connection to WebSocket
+        wss.handleUpgrade(request, socket, head, (ws) => {
+          wss.emit('connection', ws, request, { docName });
+        });
+      } catch (err) {
+        socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+        socket.destroy();
+      }
+    }
+  });
+
+  return wss;
+}
+
+
+--------------------------------------------------------------------------------
+3. MONGOOSE DATA MODELS
+--------------------------------------------------------------------------------
+
+--- Document Model (server/models/Document.js) ---
+import mongoose from 'mongoose';
+
+const documentSchema = new mongoose.Schema({
+  title: { type: String, required: true, default: 'Untitled Document', trim: true },
+  ownerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  collaborators: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  content: { type: String, default: '' },
+  jsonState: { type: String, default: '' },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+});
+
+documentSchema.pre('save', function (next) {
+  this.updatedAt = Date.now();
+  next();
+});
+
+export default mongoose.model('Document', documentSchema);
+
+
+--- Version Model (server/models/Version.js) ---
+import mongoose from 'mongoose';
+
+const versionSchema = new mongoose.Schema({
+  documentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Document', required: true },
+  versionNumber: { type: Number, required: true },
+  content: { type: String, required: true },
+  modifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  changeDescription: { type: String, default: 'Snapshot saved' },
+  createdAt: { type: Date, default: Date.now },
+});
+
+export default mongoose.model('Version', versionSchema);
+
+
+--- User Model (server/models/User.js) ---
+import mongoose from 'mongoose';
+
+const userSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true },
+  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  passwordHash: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now },
+});
+
+export default mongoose.model('User', userSchema);
+
+
+--------------------------------------------------------------------------------
+4. JWT AUTHENTICATION MIDDLEWARE & ROUTES
+--------------------------------------------------------------------------------
+
+--- Auth Middleware (server/middleware/auth.js) ---
+import jwt from 'jsonwebtoken';
+
+const JWT_SECRET = process.env.JWT_SECRET || 'capstone_secret_jwt_key_collaborative_docs_2026';
+
+export function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ message: 'Authentication required. No token provided.' });
+  }
+
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: 'Invalid or expired authentication token' });
+  }
+}
+
+
+--- Auth Routes (server/routes/auth.js) ---
+import express from 'express';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import User from '../models/User.js';
+import { authMiddleware } from '../middleware/auth.js';
+
+const router = express.Router();
+const JWT_SECRET = process.env.JWT_SECRET || 'capstone_secret_jwt_key_collaborative_docs_2026';
+
+// Register User
+router.post('/register', async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: 'Name, email, and password are required' });
+    }
+
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ message: 'User with this email already exists' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(password, salt);
+
+    const user = new User({ name, email, passwordHash });
+    await user.save();
+
+    const token = jwt.sign({ id: user._id, email: user.email, name: user.name }, JWT_SECRET, { expiresIn: '7d' });
+    res.status(201).json({ token, user: { id: user._id, name: user.name, email: user.email } });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error during registration' });
+  }
+});
+
+// Login User
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Email and password are required' });
+    }
+
+    const user = await User.findOne({ email });
+    if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+      return res.status(400).json({ message: 'Invalid email or password' });
+    }
+
+    const token = jwt.sign({ id: user._id, email: user.email, name: user.name }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: user._id, name: user.name, email: user.email } });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error during login' });
+  }
+});
+
+export default router;
+
+
+--------------------------------------------------------------------------------
+5. DOCUMENT CRUD & COLLABORATOR ROUTES (server/routes/documents.js)
+--------------------------------------------------------------------------------
+import express from 'express';
+import Document from '../models/Document.js';
+import Version from '../models/Version.js';
+import User from '../models/User.js';
+import { authMiddleware } from '../middleware/auth.js';
+
+const router = express.Router();
+
+export function checkDocumentAccess(doc, userId) {
+  const ownerIdStr = doc.ownerId?._id ? doc.ownerId._id.toString() : doc.ownerId?.toString();
+  const isOwner = ownerIdStr === userId;
+  const isCollaborator = Array.isArray(doc.collaborators) && doc.collaborators.some((collab) => {
+    const collabIdStr = collab?._id ? collab._id.toString() : collab?.toString();
+    return collabIdStr === userId;
+  });
+  return { isOwner, isCollaborator, hasAccess: isOwner || isCollaborator };
+}
+
+// GET /api/documents (Fetch user's owned and shared documents)
+router.get('/', authMiddleware, async (req, res) => {
+  const documents = await Document.find({
+    $or: [{ ownerId: req.user.id }, { collaborators: req.user.id }],
+  }).populate('ownerId', 'name email').populate('collaborators', 'name email').sort({ updatedAt: -1 });
+
+  res.json({ documents });
+});
+
+// POST /api/documents (Create document + initial version v1 snapshot)
+router.post('/', authMiddleware, async (req, res) => {
+  const { title, content } = req.body;
+  const doc = new Document({
+    title: title || 'Cloud Computing Notes',
+    ownerId: req.user.id,
+    collaborators: [],
+    content: content || '<p>Welcome to your collaborative document! Type here...</p>',
+  });
+  await doc.save();
+
+  const initialVersion = new Version({
+    documentId: doc._id,
+    versionNumber: 1,
+    content: doc.content,
+    modifiedBy: req.user.id,
+    changeDescription: 'Document created',
+  });
+  await initialVersion.save();
+
+  res.status(201).json({ document: doc, version: initialVersion });
+});
+
+// PUT /api/documents/:id (Update title or content)
+router.put('/:id', authMiddleware, async (req, res) => {
+  const doc = await Document.findById(req.params.id);
+  if (!doc) return res.status(404).json({ message: 'Document not found' });
+
+  const { hasAccess } = checkDocumentAccess(doc, req.user.id);
+  if (!hasAccess) return res.status(403).json({ message: 'Access denied' });
+
+  const { title, content, jsonState } = req.body;
+  if (title) doc.title = title.trim();
+  if (content !== undefined) doc.content = content;
+  if (jsonState !== undefined) doc.jsonState = jsonState;
+
+  await doc.save();
+  res.json({ document: doc });
+});
+
+// POST /api/documents/:id/collaborators (Add collaborator by email - Owner only)
+router.post('/:id/collaborators', authMiddleware, async (req, res) => {
+  const { email } = req.body;
+  const doc = await Document.findById(req.params.id);
+  const { isOwner } = checkDocumentAccess(doc, req.user.id);
+  if (!isOwner) return res.status(403).json({ message: 'Only owner can manage collaborators' });
+
+  const targetUser = await User.findOne({ email: email.toLowerCase().trim() });
+  if (!targetUser) return res.status(404).json({ message: 'User not found' });
+
+  if (!doc.collaborators.includes(targetUser._id)) {
+    doc.collaborators.push(targetUser._id);
+    await doc.save();
+  }
+  res.json({ message: `Added ${targetUser.name} as collaborator`, document: doc });
+});
+
+export default router;
+
+
+--------------------------------------------------------------------------------
+6. VERSION CONTROL & RESTORATION ROUTES (server/routes/versions.js)
+--------------------------------------------------------------------------------
+import express from 'express';
+import Version from '../models/Version.js';
+import Document from '../models/Document.js';
+import { authMiddleware } from '../middleware/auth.js';
+import { checkDocumentAccess } from './documents.js';
+
+const router = express.Router();
+
+// GET /api/documents/:id/versions (List version history)
+router.get('/:id/versions', authMiddleware, async (req, res) => {
+  const versions = await Version.find({ documentId: req.params.id })
+    .populate('modifiedBy', 'name email')
+    .sort({ versionNumber: -1 });
+
+  res.json({ versions });
+});
+
+// POST /api/documents/:id/versions (Create manual snapshot vN)
+router.post('/:id/versions', authMiddleware, async (req, res) => {
+  const { changeDescription, content } = req.body;
+  const latestVersion = await Version.findOne({ documentId: req.params.id }).sort({ versionNumber: -1 });
+  const nextVersionNumber = latestVersion ? latestVersion.versionNumber + 1 : 1;
+
+  const newVersion = new Version({
+    documentId: req.params.id,
+    versionNumber: nextVersionNumber,
+    content: content,
+    modifiedBy: req.user.id,
+    changeDescription: changeDescription || `Version ${nextVersionNumber} snapshot`,
+  });
+
+  await newVersion.save();
+  await newVersion.populate('modifiedBy', 'name email');
+  res.status(201).json({ version: newVersion });
+});
+
+// POST /api/documents/:id/versions/:versionId/restore (Non-destructive Restoration)
+router.post('/:id/versions/:versionId/restore', authMiddleware, async (req, res) => {
+  const doc = await Document.findById(req.params.id);
+  const targetVersion = await Version.findById(req.params.versionId);
+  if (!doc || !targetVersion) return res.status(404).json({ message: 'Not found' });
+
+  // 1. Update active document content
+  doc.content = targetVersion.content;
+  await doc.save();
+
+  // 2. Compute next version number
+  const latestVersion = await Version.findOne({ documentId: req.params.id }).sort({ versionNumber: -1 });
+  const newVersionNumber = latestVersion ? latestVersion.versionNumber + 1 : 1;
+
+  // 3. Create NEW snapshot for restored state (preserving history v1..vN)
+  const restoredSnapshot = new Version({
+    documentId: doc._id,
+    versionNumber: newVersionNumber,
+    content: targetVersion.content,
+    modifiedBy: req.user.id,
+    changeDescription: `Restored from version v${targetVersion.versionNumber}`,
+  });
+
+  await restoredSnapshot.save();
+  res.json({
+    message: `Restored v${targetVersion.versionNumber}. Created new version v${newVersionNumber}.`,
+    document: doc,
+    restoredVersion: restoredSnapshot,
+  });
+});
+
+export default router;
+
+
+--------------------------------------------------------------------------------
+7. CLIENT API SERVICE (client/src/services/api.js)
+--------------------------------------------------------------------------------
+const API_URL = import.meta.env.VITE_API_URL || '/api';
+
+const getHeaders = () => {
+  const token = localStorage.getItem('token');
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+};
+
+async function handleResponse(response) {
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.message || `Request failed with status ${response.status}`);
+  }
+  return data;
+}
+
+export const api = {
+  login: async (email, password) => {
+    const res = await fetch(`${API_URL}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    return handleResponse(res);
+  },
+
+  getDocuments: async () => {
+    const res = await fetch(`${API_URL}/documents`, { headers: getHeaders() });
+    return handleResponse(res);
+  },
+
+  getDocument: async (id) => {
+    const res = await fetch(`${API_URL}/documents/${id}`, { headers: getHeaders() });
+    return handleResponse(res);
+  },
+
+  updateDocument: async (id, data) => {
+    const res = await fetch(`${API_URL}/documents/${id}`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify(data),
+    });
+    return handleResponse(res);
+  },
+
+  getVersions: async (docId) => {
+    const res = await fetch(`${API_URL}/documents/${docId}/versions`, { headers: getHeaders() });
+    return handleResponse(res);
+  },
+
+  createVersion: async (docId, changeDescription, content) => {
+    const res = await fetch(`${API_URL}/documents/${docId}/versions`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ changeDescription, content }),
+    });
+    return handleResponse(res);
+  },
+
+  restoreVersion: async (docId, versionId) => {
+    const res = await fetch(`${API_URL}/documents/${docId}/versions/${versionId}/restore`, {
+      method: 'POST',
+      headers: getHeaders(),
+    });
+    return handleResponse(res);
+  },
+};
+
+
+--------------------------------------------------------------------------------
+8. COLLABORATIVE DOCUMENT EDITOR COMPONENT (client/src/pages/DocumentEditor.jsx)
+--------------------------------------------------------------------------------
+import React, { useState, useEffect, useMemo } from 'react';
+import { useParams } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import { api } from '../services/api';
+
+import { useEditor, EditorContent } from '@tiptap/react';
+import StarterKit from '@tiptap/starter-kit';
+import Collaboration from '@tiptap/extension-collaboration';
+import CollaborationCursor from '@tiptap/extension-collaboration-cursor';
+
+import * as Y from 'yjs';
+import { WebsocketProvider } from 'y-websocket';
+
+export default function DocumentEditor() {
+  const { id: docId } = useParams();
+  const { user } = useAuth();
+
+  const [documentMeta, setDocumentMeta] = useState(null);
+  const [provider, setProvider] = useState(null);
+  const [collaborators, setCollaborators] = useState([]);
+
+  // 1. Initialize Y.js Document CRDT
+  const ydoc = useMemo(() => new Y.Doc(), [docId]);
+
+  // 2. Setup Y-Websocket Synchronization Provider & User Awareness
+  useEffect(() => {
+    if (!docId || !user) return;
+
+    const rawWsUrl = import.meta.env.VITE_WS_URL || 'ws://localhost:5000';
+    const token = localStorage.getItem('token');
+
+    const wsProvider = new WebsocketProvider(rawWsUrl, `doc-${docId}`, ydoc, {
+      params: { token },
+    });
+
+    // Set collaborator cursor color & identity awareness
+    wsProvider.awareness.setLocalStateField('user', {
+      name: user.name,
+      color: '#6366f1',
+      clientId: ydoc.clientID,
+    });
+
+    const updateAwareness = () => {
+      const states = Array.from(wsProvider.awareness.getStates().values());
+      setCollaborators(states.map((s) => s.user).filter(Boolean));
+    };
+
+    wsProvider.awareness.on('change', updateAwareness);
+    setProvider(wsProvider);
+
+    return () => {
+      wsProvider.destroy();
+    };
+  }, [docId, ydoc, user]);
+
+  // 3. Configure Tiptap Rich Text Editor with Y.js CRDT Extension
+  const editor = useEditor({
+    extensions: [
+      StarterKit.configure({ history: false }), // CRDT handles undo/redo
+      Collaboration.configure({ document: ydoc }),
+      ...(provider ? [CollaborationCursor.configure({ provider, user: { name: user?.name, color: '#6366f1' } })] : []),
+    ],
+  }, [provider]);
+
+  return (
+    <div className="editor-container">
+      <div className="editor-area">
+        <EditorContent editor={editor} />
+      </div>
+    </div>
+  );
+}
+
+
+--------------------------------------------------------------------------------
+9. VERSION HISTORY COMPONENT (client/src/components/VersionHistory.jsx)
+--------------------------------------------------------------------------------
+import React, { useState } from 'react';
+import { History, X, RotateCcw, Eye, PlusCircle } from 'lucide-react';
+
+export default function VersionHistory({
+  versions = [],
+  onClose,
+  onSaveVersion,
+  onViewVersion,
+  onRestoreVersion,
+  isLoading
+}) {
+  const [desc, setDesc] = useState('');
+
+  const handleSaveSubmit = (e) => {
+    e.preventDefault();
+    if (!desc.trim()) return;
+    onSaveVersion(desc.trim());
+    setDesc('');
+  };
+
+  return (
+    <div className="version-sidebar">
+      <div className="version-sidebar-header">
+        <h3>Version History</h3>
+        <button onClick={onClose}><X size={18} /></button>
+      </div>
+
+      <form onSubmit={handleSaveSubmit} style={{ padding: '1rem' }}>
+        <input
+          type="text"
+          placeholder="Version snapshot description..."
+          value={desc}
+          onChange={(e) => setDesc(e.target.value)}
+          required
+        />
+        <button type="submit" className="btn btn-primary btn-sm">Save Snapshot</button>
+      </form>
+
+      <div className="version-list">
+        {versions.map((ver) => (
+          <div key={ver._id} className="version-item">
+            <div className="version-badge">v{ver.versionNumber}</div>
+            <div>{ver.changeDescription}</div>
+            <div className="version-meta">
+              By {ver.modifiedBy?.name} on {new Date(ver.createdAt).toLocaleString()}
+            </div>
+            <div className="version-actions">
+              <button onClick={() => onViewVersion(ver)}><Eye size={13} /> View</button>
+              <button onClick={() => onRestoreVersion(ver)}><RotateCcw size={13} /> Restore</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+--------------------------------------------------------------------------------
+10. COLLABORATORS & ACCESS MANAGEMENT COMPONENT (client/src/components/Collaborators.jsx)
+--------------------------------------------------------------------------------
+import React, { useState } from 'react';
+import { Users, UserPlus, Shield } from 'lucide-react';
+
+export default function Collaborators({
+  activeUsers = [],
+  owner,
+  collaborators = [],
+  isOwner = false,
+  onAddCollaborator,
+  onRemoveCollaborator
+}) {
+  const [email, setEmail] = useState('');
+
+  const handleAdd = (e) => {
+    e.preventDefault();
+    if (email.trim()) {
+      onAddCollaborator(email.trim());
+      setEmail('');
+    }
+  };
+
+  return (
+    <div className="collaborator-bar">
+      <div className="active-users">
+        {activeUsers.map((u, i) => (
+          <span key={i} className="user-badge" style={{ backgroundColor: u.color }}>
+            {u.name}
+          </span>
+        ))}
+      </div>
+
+      {isOwner && (
+        <form onSubmit={handleAdd} className="add-collab-form">
+          <input
+            type="email"
+            placeholder="Add user email..."
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
+          <button type="submit">Add</button>
+        </form>
+      )}
+    </div>
+  );
+}
+
+
+--------------------------------------------------------------------------------
+11. DOCUMENT EXPORT UTILITIES (client/src/utils/exportUtils.js)
+--------------------------------------------------------------------------------
+export function downloadBlob(filename, content, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+export function exportAsHtml(title, htmlContent) {
+  const filename = `${title.toLowerCase().replace(/[^a-z0-9]/g, '_')}.html`;
+  const fullHtml = `<!DOCTYPE html><html><head><title>${title}</title></head><body><h1>${title}</h1>${htmlContent}</body></html>`;
+  downloadBlob(filename, fullHtml, 'text/html;charset=utf-8');
+}
+
+export function exportAsText(title, htmlContent) {
+  const temp = document.createElement('div');
+  temp.innerHTML = htmlContent || '';
+  const textContent = temp.textContent || temp.innerText || '';
+  const formattedText = `${title}\n${'='.repeat(title.length)}\n\n${textContent}`;
+  downloadBlob(`${title}.txt`, formattedText, 'text/plain;charset=utf-8');
+}
+
+export function exportAsMarkdown(title, htmlContent) {
+  let md = htmlContent || '';
+  md = md.replace(/<h1>(.*?)<\/h1>/gi, '# $1\n\n')
+         .replace(/<h2>(.*?)<\/h2>/gi, '## $1\n\n')
+         .replace(/<strong>(.*?)<\/strong>/gi, '**$1**')
+         .replace(/<em>(.*?)<\/em>/gi, '*$1*')
+         .replace(/<p>(.*?)<\/p>/gi, '$1\n\n');
+
+  const temp = document.createElement('div');
+  temp.innerHTML = md;
+  downloadBlob(`${title}.md`, `# ${title}\n\n${temp.textContent || ''}`, 'text/markdown;charset=utf-8');
+}
+
+================================================================================
+END OF CODE SNIPPETS FILE
+================================================================================
